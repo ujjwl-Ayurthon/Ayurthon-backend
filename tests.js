@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const Test = require('./Test');
 const Question = require('./Question');
-const { v4: uuidv4 } = require('uuid');
 const { sendTestToChannel } = require('./telegramBot');
 
 function adminAuth(req, res, next) {
@@ -13,6 +12,7 @@ function adminAuth(req, res, next) {
   next();
 }
 
+// ─── Create Test ───────────────────────────────────────────
 router.post('/', adminAuth, async (req, res) => {
   try {
     const { title, type, question_ids, duration_minutes, sections, negative_marks } = req.body;
@@ -21,11 +21,11 @@ router.post('/', adminAuth, async (req, res) => {
     }
     const test = new Test({
       title, type,
-      questions: question_ids,
+      questions:        question_ids,
       duration_minutes: duration_minutes || 60,
-      total_marks: question_ids.length,
-      negative_marks: negative_marks || 0,
-      sections: sections || []
+      total_marks:      question_ids.length,
+      negative_marks:   negative_marks || 0,
+      sections:         sections || []
     });
     await test.save();
     await Question.updateMany({ _id: { $in: question_ids } }, { $push: { used_in_tests: test._id } });
@@ -35,15 +35,17 @@ router.post('/', adminAuth, async (req, res) => {
   }
 });
 
+// ─── Get All Tests ─────────────────────────────────────────
 router.get('/', adminAuth, async (req, res) => {
   try {
-    const tests = await Test.find().sort({ created_at: -1 }).select('-questions');
+    const tests = await Test.find().sort({ created_at: -1 });
     res.json({ success: true, tests });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ─── Get Single Test ───────────────────────────────────────
 router.get('/:id', adminAuth, async (req, res) => {
   try {
     const test = await Test.findById(req.params.id).populate('questions');
@@ -54,6 +56,7 @@ router.get('/:id', adminAuth, async (req, res) => {
   }
 });
 
+// ─── Get Test by Token (Student) ──────────────────────────
 router.get('/attempt/:token', async (req, res) => {
   try {
     const test = await Test.findOne({ link_token: req.params.token, status: 'published' })
@@ -65,37 +68,52 @@ router.get('/attempt/:token', async (req, res) => {
   }
 });
 
+// ─── Publish Test (with Telegram inline button) ────────────
 router.post('/:id/publish', adminAuth, async (req, res) => {
   try {
-    const test = await Test.findById(req.params.id);
+    const test = await Test.findById(req.params.id).populate('questions');
     if (!test) return res.status(404).json({ error: 'Test not found' });
-    test.status = 'published';
+    if (test.status === 'published') return res.status(400).json({ error: 'Already published' });
+
+    test.status       = 'published';
     test.published_at = new Date();
     await test.save();
-    const frontendUrl = process.env.FRONTEND_URL;
-    const testLink = `${frontendUrl}/test/${test.link_token}`;
+
+    // Build full URL from env
+    const frontendUrl = process.env.FRONTEND_URL?.replace(/\/$/, '');
+    const testLink    = `${frontendUrl}/test/${test.link_token}`;
+
+    let telegram_sent = false;
     try {
       await sendTestToChannel(test, testLink);
+      telegram_sent = true;
       test.telegram_sent = true;
       await test.save();
     } catch (botErr) {
       console.error('Telegram error:', botErr.message);
     }
-    res.json({ success: true, message: 'Test published!', link: testLink, telegram_sent: test.telegram_sent, test });
+
+    res.json({ success: true, message: 'Test published!', link: testLink, telegram_sent, test });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ─── Close Test ────────────────────────────────────────────
 router.post('/:id/close', adminAuth, async (req, res) => {
   try {
-    const test = await Test.findByIdAndUpdate(req.params.id, { status: 'closed', closed_at: new Date() }, { new: true });
+    const test = await Test.findByIdAndUpdate(
+      req.params.id,
+      { status: 'closed', closed_at: new Date() },
+      { new: true }
+    );
     res.json({ success: true, test });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ─── Delete Test ───────────────────────────────────────────
 router.delete('/:id', adminAuth, async (req, res) => {
   try {
     await Test.findByIdAndDelete(req.params.id);
