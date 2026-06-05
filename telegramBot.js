@@ -10,50 +10,86 @@ try {
   console.error('❌ Telegram Bot error:', err.message);
 }
 
+// Build channels array from env variables
 function getChannels() {
   const channels = [];
   let i = 1;
   while (process.env[`TELEGRAM_CHANNEL_${i}`]) {
+    const rawId = process.env[`TELEGRAM_CHANNEL_${i}`].trim();
+    // Keep only digits and leading minus sign
+    const numericId = rawId.replace(/[^0-9-]/g, '');
     channels.push({
-      id:   process.env[`TELEGRAM_CHANNEL_${i}`].trim(),
-      name: process.env[`TELEGRAM_CHANNEL_${i}_NAME`] || `Channel ${i}`
+      id:   numericId,
+      name: process.env[`TELEGRAM_CHANNEL_${i}_NAME`]?.trim() || `Channel ${i}`
     });
     i++;
   }
+  // Fallback to old single variable
   if (channels.length === 0 && process.env.TELEGRAM_CHANNEL_ID) {
-    channels.push({ id: process.env.TELEGRAM_CHANNEL_ID, name: 'Main Channel' });
+    channels.push({
+      id:   process.env.TELEGRAM_CHANNEL_ID.replace(/[^0-9-]/g, ''),
+      name: 'Main Channel'
+    });
   }
   return channels;
 }
 
-async function sendTestToChannel(test, testLink, channelId) {
+// Resolve channel — accept id or name, return numeric id
+function resolveChannelId(channelIdOrName) {
+  const channels = getChannels();
+  if (!channelIdOrName) return channels[0]?.id || null;
+
+  // Try exact id match first
+  const byId = channels.find(c => c.id === String(channelIdOrName).trim());
+  if (byId) return byId.id;
+
+  // Try name match (case-insensitive)
+  const byName = channels.find(
+    c => c.name.toLowerCase() === String(channelIdOrName).trim().toLowerCase()
+  );
+  if (byName) return byName.id;
+
+  // Try partial name match
+  const partial = channels.find(
+    c => c.name.toLowerCase().includes(String(channelIdOrName).trim().toLowerCase())
+  );
+  if (partial) return partial.id;
+
+  // Fallback to first channel
+  return channels[0]?.id || null;
+}
+
+// Send test notification using HTML parse_mode (safe for Sanskrit/special chars)
+async function sendTestToChannel(test, testLink, channelIdOrName, customMessage) {
   if (!bot) throw new Error('Bot not initialized');
 
-  const channels = getChannels();
-  const targetId = channelId || channels[0]?.id;
-  if (!targetId) throw new Error('No channel ID configured');
+  const targetId = resolveChannelId(channelIdOrName);
+  if (!targetId) throw new Error('No valid channel ID found. Check TELEGRAM_CHANNEL_1 env variable.');
+
+  console.log(`📤 Sending to channel: ${targetId}`);
 
   const typeEmoji = { daily: '📅', diagnostic: '🩺', weekly: '📆', grand: '🏆' };
   const typeLabel = { daily: 'Daily CBT', diagnostic: 'Diagnostic Test', weekly: 'Weekly CBT', grand: 'Grand Test' };
-  const negMarks  = test.negative_marks > 0
-    ? `\n➖ Negative Marking: ${test.negative_marks}`
-    : '\n✅ No Negative Marking';
 
-  const message =
-`${typeEmoji[test.type] || '📝'} *Ayurthon — ${typeLabel[test.type] || 'Test'}*
+  const negMarksLine = (test.negative_marks && Number(test.negative_marks) > 0)
+    ? `\n➖ <b>Negative Marking:</b> ${test.negative_marks}`
+    : '\n✅ <b>No Negative Marking</b>';
 
-📚 *${test.title}*
+  // Use custom message if admin edited it, otherwise use default
+  const messageText = customMessage || `${typeEmoji[test.type] || '📝'} <b>Ayurthon — ${typeLabel[test.type] || 'Test'}</b>
+
+📚 <b>${test.title}</b>
 ━━━━━━━━━━━━━━━━
-❓ Questions: *${test.questions?.length || test.total_marks}*
-⏱ Duration: *${test.duration_minutes} Minutes*
-🏆 Total Marks: *${test.total_marks}*${negMarks}
+❓ <b>Questions:</b> ${test.questions?.length || test.total_marks}
+⏱ <b>Duration:</b> ${test.duration_minutes} Minutes
+🏆 <b>Total Marks:</b> ${test.total_marks}${negMarksLine}
 ━━━━━━━━━━━━━━━━
-📊 Result & Leaderboard turant milega\\!
+📊 Result &amp; Leaderboard turant milega!
 
-_सभी को शुभकामनाएं\\! 🌿_`;
+<i>सभी को शुभकामनाएं! 🌿</i>`;
 
-  await bot.sendMessage(targetId, message, {
-    parse_mode: 'MarkdownV2',
+  await bot.sendMessage(targetId, messageText, {
+    parse_mode: 'HTML',
     reply_markup: {
       inline_keyboard: [[
         { text: '🚀 Launch CBT Test — अभी Attempt करें', url: testLink }
@@ -61,6 +97,8 @@ _सभी को शुभकामनाएं\\! 🌿_`;
     },
     disable_web_page_preview: true
   });
+
+  console.log(`✅ Message sent to ${targetId}`);
 }
 
 function getChannelList() {
@@ -69,7 +107,11 @@ function getChannelList() {
 
 async function sendMessage(chatId, message) {
   if (!bot) return;
-  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  try {
+    await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('sendMessage error:', err.message);
+  }
 }
 
 module.exports = { bot, sendTestToChannel, sendMessage, getChannelList };
