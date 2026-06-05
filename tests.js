@@ -12,9 +12,15 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ── Get Channels List ──────────────────────────────────────
+// ── Channels List ──────────────────────────────────────────
 router.get('/channels/list', adminAuth, (req, res) => {
-  res.json({ success: true, channels: getChannelList() });
+  try {
+    const channels = getChannelList();
+    console.log('Channels loaded:', channels);
+    res.json({ success: true, channels });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Create Test ────────────────────────────────────────────
@@ -22,14 +28,14 @@ router.post('/', adminAuth, async (req, res) => {
   try {
     const { title, type, question_ids, duration_minutes, sections, negative_marks } = req.body;
     if (!title || !type || !question_ids || question_ids.length === 0) {
-      return res.status(400).json({ error: 'title, type and question_ids are required' });
+      return res.status(400).json({ error: 'title, type and question_ids required' });
     }
     const test = new Test({
       title, type,
       questions:        question_ids,
       duration_minutes: duration_minutes || 60,
       total_marks:      question_ids.length,
-      negative_marks:   negative_marks || 0,
+      negative_marks:   Number(negative_marks) || 0,
       sections:         sections || []
     });
     await test.save();
@@ -53,7 +59,7 @@ router.get('/', adminAuth, async (req, res) => {
   }
 });
 
-// ── Get Single Test ────────────────────────────────────────
+// ── Get Single Test (admin) ────────────────────────────────
 router.get('/:id', adminAuth, async (req, res) => {
   try {
     const test = await Test.findById(req.params.id).populate('questions');
@@ -64,11 +70,13 @@ router.get('/:id', adminAuth, async (req, res) => {
   }
 });
 
-// ── Get Test by Token (Student) ────────────────────────────
+// ── Get Test by Token (Student — no auth) ─────────────────
 router.get('/attempt/:token', async (req, res) => {
   try {
-    const test = await Test.findOne({ link_token: req.params.token, status: 'published' })
-      .populate('questions', 'text type options reference');
+    const test = await Test.findOne({
+      link_token: req.params.token,
+      status: 'published'
+    }).populate('questions', 'text type options reference');
     if (!test) return res.status(404).json({ error: 'Test not found or not active' });
     res.json({ success: true, test });
   } catch (err) {
@@ -79,29 +87,46 @@ router.get('/attempt/:token', async (req, res) => {
 // ── Publish Test ───────────────────────────────────────────
 router.post('/:id/publish', adminAuth, async (req, res) => {
   try {
-    const { channel_id } = req.body;
+    const { channel_id, custom_message } = req.body;
+
     const test = await Test.findById(req.params.id).populate('questions');
     if (!test) return res.status(404).json({ error: 'Test not found' });
-    if (test.status === 'published') return res.status(400).json({ error: 'Already published' });
+    if (test.status === 'published') {
+      return res.status(400).json({ error: 'Test already published' });
+    }
 
     test.status       = 'published';
     test.published_at = new Date();
     await test.save();
 
-    const frontendUrl = process.env.FRONTEND_URL?.replace(/\/$/, '');
+    const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
     const testLink    = `${frontendUrl}/test/${test.link_token}`;
 
-    let telegram_sent = false;
+    console.log(`Publishing test: ${test.title}`);
+    console.log(`Test link: ${testLink}`);
+    console.log(`Channel: ${channel_id}`);
+
+    let telegram_sent  = false;
+    let telegram_error = null;
+
     try {
-      await sendTestToChannel(test, testLink, channel_id);
+      await sendTestToChannel(test, testLink, channel_id, custom_message || null);
       telegram_sent      = true;
       test.telegram_sent = true;
       await test.save();
     } catch (botErr) {
+      telegram_error = botErr.message;
       console.error('Telegram error:', botErr.message);
     }
 
-    res.json({ success: true, message: 'Test published!', link: testLink, telegram_sent, test });
+    res.json({
+      success: true,
+      message: 'Test published!',
+      link: testLink,
+      telegram_sent,
+      telegram_error,
+      test
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
