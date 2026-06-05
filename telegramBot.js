@@ -18,23 +18,37 @@ async function sendTestToChannel(test, testLink) {
   const typeEmoji = { daily: '📅', diagnostic: '🩺', weekly: '📆', grand: '🏆' };
   const typeLabel = { daily: 'Daily CBT', diagnostic: 'Diagnostic Test', weekly: 'Weekly CBT', grand: 'Grand Test' };
 
-  const message = `
-🔔 *Ayurthon ${typeLabel[test.type] || 'Test'} Live\\!*
+  const negMarks = test.negative_marks > 0 ? `\n➖ Negative Marking: ${test.negative_marks}` : '\n✅ No Negative Marking';
+
+  // Clean message — no raw URL visible
+  const message =
+`${typeEmoji[test.type] || '📝'} *Ayurthon — ${typeLabel[test.type] || 'Test'}*
 
 📚 *${test.title}*
+━━━━━━━━━━━━━━━━
+❓ Questions: *${test.questions?.length || test.total_marks}*
+⏱ Duration: *${test.duration_minutes} Minutes*
+🏆 Total Marks: *${test.total_marks}*${negMarks}
+━━━━━━━━━━━━━━━━
+📊 Result & Leaderboard turant milega!
 
-${typeEmoji[test.type] || '📝'} Type: ${typeLabel[test.type] || 'Test'}
-⏱ Duration: ${test.duration_minutes} Minutes
-❓ Questions: ${test.questions.length}
+_सभी को शुभकामनाएं! 🌿_`;
 
-🏆 Leaderboard milega result ke saath\\!
+  // Inline keyboard — URL hidden inside button
+  const inlineKeyboard = {
+    inline_keyboard: [[
+      {
+        text: '🚀 Launch CBT Test — अभी Attempt करें',
+        url: testLink
+      }
+    ]]
+  };
 
-👉 [अभी Attempt करें](${testLink})
-
-_All the best\\! 🌿_
-  `.trim();
-
-  await bot.sendMessage(channelId, message, { parse_mode: 'MarkdownV2', disable_web_page_preview: false });
+  await bot.sendMessage(channelId, message, {
+    parse_mode:              'Markdown',
+    reply_markup:            inlineKeyboard,
+    disable_web_page_preview: true
+  });
 }
 
 async function sendMessage(chatId, message) {
