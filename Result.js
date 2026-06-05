@@ -1,8 +1,8 @@
 const mongoose = require('mongoose');
 
 const ResultSchema = new mongoose.Schema({
-  student_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
-  test_id:    { type: mongoose.Schema.Types.ObjectId, ref: 'Test',    required: true },
+  student_id:  { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
+  test_id:     { type: mongoose.Schema.Types.ObjectId, ref: 'Test',    required: true },
 
   score:       { type: Number, required: true },
   total_marks: { type: Number, required: true },
@@ -16,17 +16,19 @@ const ResultSchema = new mongoose.Schema({
 
   answers: [{
     question_id:     { type: mongoose.Schema.Types.ObjectId, ref: 'Question' },
-    selected_option: { type: String, default: null }, // null = unattempted
+    selected_option: { type: String, default: null },
     correct_option:  { type: String },
-    is_correct:      { type: Boolean }
+    is_correct:      { type: Boolean },
+    is_skipped:      { type: Boolean, default: false }
   }],
 
-  wrong_questions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Question' }],
+  wrong_questions:   [{ type: mongoose.Schema.Types.ObjectId, ref: 'Question' }],
+  skipped_questions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Question' }],
 
   submitted_at: { type: Date, default: Date.now }
 });
 
-ResultSchema.index({ test_id: 1, score: -1 });
+ResultSchema.index({ test_id: 1, score: -1, time_taken_seconds: 1 });
 ResultSchema.index({ student_id: 1 });
 
 module.exports = mongoose.model('Result', ResultSchema);
