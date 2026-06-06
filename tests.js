@@ -1,7 +1,8 @@
-const express = require('express');
-const router  = express.Router();
+const express  = require('express');
+const router   = express.Router();
 const Test     = require('./Test');
 const Question = require('./Question');
+const Result   = require('./Result');
 const { sendTestToChannel, getChannelList } = require('./telegramBot');
 
 function adminAuth(req, res, next) {
@@ -12,12 +13,46 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ── Channels List ──────────────────────────────────────────
+// ── Channels list ──────────────────────────────────────────
 router.get('/channels/list', adminAuth, (req, res) => {
   try {
-    const channels = getChannelList();
-    console.log('Channels loaded:', channels);
-    res.json({ success: true, channels });
+    res.json({ success: true, channels: getChannelList() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Scheduled tests — check & auto-publish ────────────────
+// Call this route via a cron/ping service (e.g. cron-job.org every 5 min)
+router.post('/scheduled/run', async (req, res) => {
+  try {
+    const now = new Date();
+    const pending = await Test.find({
+      status:           'draft',
+      scheduled_at:     { $lte: now },
+      scheduled_at:     { $ne: null }
+    }).populate('questions');
+
+    const published = [];
+    for (const test of pending) {
+      try {
+        test.status       = 'published';
+        test.published_at = now;
+        await test.save();
+
+        const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
+        const testLink    = `${frontendUrl}/test/${test.link_token}`;
+
+        await sendTestToChannel(test, testLink, test.scheduled_channel || null, null);
+        test.telegram_sent = true;
+        await test.save();
+        published.push(test.title);
+      } catch (e) {
+        console.error('Scheduled publish error for', test.title, e.message);
+      }
+    }
+
+    res.json({ success: true, published, count: published.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -26,23 +61,30 @@ router.get('/channels/list', adminAuth, (req, res) => {
 // ── Create Test ────────────────────────────────────────────
 router.post('/', adminAuth, async (req, res) => {
   try {
-    const { title, type, question_ids, duration_minutes, sections, negative_marks } = req.body;
+    const { title, type, question_ids, duration_minutes,
+            sections, negative_marks, scheduled_at, scheduled_channel } = req.body;
+
     if (!title || !type || !question_ids || question_ids.length === 0) {
       return res.status(400).json({ error: 'title, type and question_ids required' });
     }
+
     const test = new Test({
       title, type,
-      questions:        question_ids,
-      duration_minutes: duration_minutes || 60,
-      total_marks:      question_ids.length,
-      negative_marks:   Number(negative_marks) || 0,
-      sections:         sections || []
+      questions:          question_ids,
+      duration_minutes:   duration_minutes   || 60,
+      total_marks:        question_ids.length,
+      negative_marks:     Number(negative_marks) || 0,
+      sections:           sections           || [],
+      scheduled_at:       scheduled_at       || null,
+      scheduled_channel:  scheduled_channel  || null
     });
     await test.save();
+
     await Question.updateMany(
       { _id: { $in: question_ids } },
       { $push: { used_in_tests: test._id } }
     );
+
     res.json({ success: true, test });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -59,7 +101,7 @@ router.get('/', adminAuth, async (req, res) => {
   }
 });
 
-// ── Get Single Test (admin) ────────────────────────────────
+// ── Get Single Test ────────────────────────────────────────
 router.get('/:id', adminAuth, async (req, res) => {
   try {
     const test = await Test.findById(req.params.id).populate('questions');
@@ -70,14 +112,43 @@ router.get('/:id', adminAuth, async (req, res) => {
   }
 });
 
-// ── Get Test by Token (Student — no auth) ─────────────────
+// ── Get Test by Token (Student) ────────────────────────────
 router.get('/attempt/:token', async (req, res) => {
   try {
-    const test = await Test.findOne({
-      link_token: req.params.token,
-      status: 'published'
-    }).populate('questions', 'text type options reference');
+    const test = await Test.findOne({ link_token: req.params.token, status: 'published' })
+      .populate('questions', 'text type options reference');
     if (!test) return res.status(404).json({ error: 'Test not found or not active' });
+    res.json({ success: true, test });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Edit Draft Test ────────────────────────────────────────
+router.put('/:id', adminAuth, async (req, res) => {
+  try {
+    const { title, type, duration_minutes, negative_marks,
+            question_ids, scheduled_at, scheduled_channel } = req.body;
+
+    const test = await Test.findById(req.params.id);
+    if (!test) return res.status(404).json({ error: 'Test not found' });
+    if (test.status !== 'draft') {
+      return res.status(400).json({ error: 'Only draft tests can be edited' });
+    }
+
+    if (title)            test.title            = title;
+    if (type)             test.type             = type;
+    if (duration_minutes) test.duration_minutes = Number(duration_minutes);
+    if (negative_marks !== undefined) test.negative_marks = Number(negative_marks);
+    if (scheduled_at)     test.scheduled_at     = scheduled_at;
+    if (scheduled_channel) test.scheduled_channel = scheduled_channel;
+
+    if (question_ids && question_ids.length > 0) {
+      test.questions   = question_ids;
+      test.total_marks = question_ids.length;
+    }
+
+    await test.save();
     res.json({ success: true, test });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -92,7 +163,7 @@ router.post('/:id/publish', adminAuth, async (req, res) => {
     const test = await Test.findById(req.params.id).populate('questions');
     if (!test) return res.status(404).json({ error: 'Test not found' });
     if (test.status === 'published') {
-      return res.status(400).json({ error: 'Test already published' });
+      return res.status(400).json({ error: 'Already published' });
     }
 
     test.status       = 'published';
@@ -101,10 +172,6 @@ router.post('/:id/publish', adminAuth, async (req, res) => {
 
     const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
     const testLink    = `${frontendUrl}/test/${test.link_token}`;
-
-    console.log(`Publishing test: ${test.title}`);
-    console.log(`Test link: ${testLink}`);
-    console.log(`Channel: ${channel_id}`);
 
     let telegram_sent  = false;
     let telegram_error = null;
@@ -119,14 +186,24 @@ router.post('/:id/publish', adminAuth, async (req, res) => {
       console.error('Telegram error:', botErr.message);
     }
 
-    res.json({
-      success: true,
-      message: 'Test published!',
-      link: testLink,
-      telegram_sent,
-      telegram_error,
-      test
-    });
+    res.json({ success: true, message: 'Published!', link: testLink, telegram_sent, telegram_error, test });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Recalculate Ranks for a Test ──────────────────────────
+router.post('/:id/recalculate-ranks', adminAuth, async (req, res) => {
+  try {
+    const results = await Result.find({ test_id: req.params.id })
+      .sort({ score: -1, time_taken_seconds: 1 });
+
+    for (let i = 0; i < results.length; i++) {
+      results[i].rank = i + 1;
+      await results[i].save();
+    }
+
+    res.json({ success: true, updated: results.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -135,12 +212,20 @@ router.post('/:id/publish', adminAuth, async (req, res) => {
 // ── Close Test ─────────────────────────────────────────────
 router.post('/:id/close', adminAuth, async (req, res) => {
   try {
+    // Recalculate final ranks on close
+    const results = await Result.find({ test_id: req.params.id })
+      .sort({ score: -1, time_taken_seconds: 1 });
+    for (let i = 0; i < results.length; i++) {
+      results[i].rank = i + 1;
+      await results[i].save();
+    }
+
     const test = await Test.findByIdAndUpdate(
       req.params.id,
       { status: 'closed', closed_at: new Date() },
       { new: true }
     );
-    res.json({ success: true, test });
+    res.json({ success: true, test, ranks_recalculated: results.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
