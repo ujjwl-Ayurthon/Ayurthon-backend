@@ -17,19 +17,21 @@ function adminAuth(req, res, next) {
 router.get('/check/:test_token/:telegram_username', async (req, res) => {
   try {
     const { test_token, telegram_username } = req.params;
+    const cleanTg = telegram_username.toLowerCase().replace('@', '');
+
     const test = await Test.findOne({ link_token: test_token });
     if (!test) return res.json({ attempted: false });
 
-    const student = await Student.findOne({
-      telegram_username: telegram_username.toLowerCase().replace('@', '')
-    });
+    const student = await Student.findOne({ telegram_username: cleanTg });
     if (!student) return res.json({ attempted: false });
 
     const existing = await Result.findOne({ student_id: student._id, test_id: test._id });
-    if (existing) return res.json({ attempted: true, result_id: existing._id });
-
+    if (existing) {
+      return res.json({ attempted: true, result_id: existing._id });
+    }
     res.json({ attempted: false });
   } catch (err) {
+    console.error('Check error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -45,38 +47,43 @@ router.post('/submit', async (req, res) => {
 
     const test = await Test.findOne({ link_token: test_token, status: 'published' })
       .populate('questions');
-    if (!test) return res.status(404).json({ error: 'Test not found or already closed' });
+    if (!test) {
+      return res.status(404).json({ error: 'Test not found or already closed' });
+    }
 
     const cleanTg = (telegram_username || '').toLowerCase().replace('@', '');
 
+    // Find or create student
     let student = await Student.findOne({ telegram_username: cleanTg });
     if (!student) {
       student = new Student({ name: student_name, telegram_username: cleanTg });
       await student.save();
     }
 
-    // Strict single attempt
+    // DATABASE-LEVEL PROTECTION
+    // If already submitted — return success with resultId (not error)
     const existing = await Result.findOne({ student_id: student._id, test_id: test._id });
     if (existing) {
-      return res.status(400).json({
-        error: 'Already attempted',
-        already_attempted: true,
-        result_id: existing._id
+      return res.json({
+        success:          true,
+        alreadySubmitted: true,
+        resultId:         existing._id
       });
     }
 
+    // Process answers
     let correct = 0, incorrect = 0, unattempted = 0;
-    const processedAnswers  = [];
-    const wrongQuestions    = [];
-    const skippedQuestions  = [];
+    const processedAnswers = [];
+    const wrongQuestions   = [];
+    const skippedQuestions = [];
 
-    test.questions.forEach(question => {
-      const qId     = question._id.toString();
+    test.questions.forEach(function(question) {
+      const qId      = question._id.toString();
       const selected = (answers[qId] !== undefined && answers[qId] !== null && answers[qId] !== '')
         ? answers[qId]
         : null;
-      const isCorrect  = selected !== null && selected === question.correct_answer;
-      const isSkipped  = selected === null;
+      const isCorrect = selected !== null && selected === question.correct_answer;
+      const isSkipped = selected === null;
 
       if (isSkipped) {
         unattempted++;
@@ -103,6 +110,7 @@ router.post('/submit', async (req, res) => {
       ? Math.round((correct / test.questions.length) * 100)
       : 0;
 
+    // Save result
     const result = new Result({
       student_id:         student._id,
       test_id:            test._id,
@@ -119,13 +127,14 @@ router.post('/submit', async (req, res) => {
     });
     await result.save();
 
+    // Update student attempts
     student.attempts.push(result._id);
     await student.save();
 
-    // Calculate rank: higher score = better, same score = less time = better
+    // Calculate rank: higher score = better rank, tie = less time = better rank
     const higherRank = await Result.countDocuments({
       test_id: test._id,
-      _id: { $ne: result._id },
+      _id:     { $ne: result._id },
       $or: [
         { score: { $gt: score } },
         { score: score, time_taken_seconds: { $lt: Number(time_taken_seconds) || 0 } }
@@ -134,7 +143,7 @@ router.post('/submit', async (req, res) => {
     result.rank = higherRank + 1;
     await result.save();
 
-    // Fetch wrong + skipped details for result page
+    // Fetch wrong + skipped question details for result page
     const [wrongDetail, skippedDetail] = await Promise.all([
       Question.find({ _id: { $in: wrongQuestions } })
         .select('text options correct_answer explanation reference type'),
@@ -166,7 +175,7 @@ router.post('/submit', async (req, res) => {
   }
 });
 
-// ── Leaderboard ────────────────────────────────────────────
+// ── Leaderboard (score DESC, time ASC) ────────────────────
 router.get('/leaderboard/:test_id', async (req, res) => {
   try {
     const { limit = 100 } = req.query;
@@ -175,18 +184,20 @@ router.get('/leaderboard/:test_id', async (req, res) => {
       .limit(Number(limit))
       .populate('student_id', 'name telegram_username');
 
-    const leaderboard = results.map((r, i) => ({
-      rank:              i + 1,
-      name:              r.student_id?.name || 'Unknown',
-      telegram_username: r.student_id?.telegram_username || '',
-      score:             r.score,
-      total:             r.total_marks,
-      correct:           r.correct,
-      incorrect:         r.incorrect,
-      unattempted:       r.unattempted || 0,
-      accuracy:          r.accuracy,
-      time_taken:        r.time_taken_seconds
-    }));
+    const leaderboard = results.map(function(r, i) {
+      return {
+        rank:              i + 1,
+        name:              r.student_id ? r.student_id.name : 'Unknown',
+        telegram_username: r.student_id ? r.student_id.telegram_username : '',
+        score:             r.score,
+        total:             r.total_marks,
+        correct:           r.correct,
+        incorrect:         r.incorrect,
+        unattempted:       r.unattempted || 0,
+        accuracy:          r.accuracy,
+        time_taken:        r.time_taken_seconds
+      };
+    });
 
     res.json({ success: true, leaderboard, total_students: results.length });
   } catch (err) {
@@ -203,26 +214,35 @@ router.get('/sheet/:test_id', adminAuth, async (req, res) => {
       .sort({ score: -1, time_taken_seconds: 1 })
       .populate('student_id', 'name telegram_username');
 
-    const sheet = results.map((r, i) => ({
-      rank:              i + 1,
-      name:              r.student_id?.name || 'Unknown',
-      telegram_username: r.student_id?.telegram_username || '',
-      score:             r.score,
-      correct:           r.correct,
-      incorrect:         r.incorrect,
-      unattempted:       r.unattempted || 0,
-      accuracy:          r.accuracy,
-      time_taken:        r.time_taken_seconds,
-      responses:         (r.answers || []).map(a => ({
-        question_id: a.question_id,
-        selected:    a.selected_option || '—',
-        correct:     a.correct_option,
-        is_correct:  a.is_correct,
-        is_skipped:  a.is_skipped
-      }))
-    }));
+    const sheet = results.map(function(r, i) {
+      return {
+        rank:              i + 1,
+        name:              r.student_id ? r.student_id.name : 'Unknown',
+        telegram_username: r.student_id ? r.student_id.telegram_username : '',
+        score:             r.score,
+        correct:           r.correct,
+        incorrect:         r.incorrect,
+        unattempted:       r.unattempted || 0,
+        accuracy:          r.accuracy,
+        time_taken:        r.time_taken_seconds,
+        responses:         (r.answers || []).map(function(a) {
+          return {
+            question_id: a.question_id,
+            selected:    a.selected_option || '—',
+            correct:     a.correct_option,
+            is_correct:  a.is_correct,
+            is_skipped:  a.is_skipped
+          };
+        })
+      };
+    });
 
-    res.json({ success: true, test_title: test?.title, questions: test?.questions, sheet });
+    res.json({
+      success:     true,
+      test_title:  test ? test.title : '',
+      questions:   test ? test.questions : [],
+      sheet
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -246,12 +266,12 @@ router.get('/analytics/:test_id', adminAuth, async (req, res) => {
     const results = await Result.find({ test_id: req.params.test_id });
     if (results.length === 0) return res.json({ success: true, analytics: null });
 
-    const scores = results.map(r => r.score);
-    const avg    = scores.reduce((a, b) => a + b, 0) / scores.length;
+    const scores = results.map(function(r) { return r.score; });
+    const avg    = scores.reduce(function(a, b) { return a + b; }, 0) / scores.length;
     const total  = results[0].total_marks;
 
     const distribution = { '0-25': 0, '26-50': 0, '51-75': 0, '76-100': 0 };
-    results.forEach(r => {
+    results.forEach(function(r) {
       const pct = (r.score / total) * 100;
       if      (pct <= 25) distribution['0-25']++;
       else if (pct <= 50) distribution['26-50']++;
@@ -264,9 +284,11 @@ router.get('/analytics/:test_id', adminAuth, async (req, res) => {
       analytics: {
         total_students:     results.length,
         average_score:      Math.round(avg * 10) / 10,
-        highest_score:      Math.max(...scores),
-        lowest_score:       Math.min(...scores),
-        average_accuracy:   Math.round(results.reduce((a, r) => a + r.accuracy, 0) / results.length),
+        highest_score:      Math.max.apply(null, scores),
+        lowest_score:       Math.min.apply(null, scores),
+        average_accuracy:   Math.round(
+          results.reduce(function(a, r) { return a + r.accuracy; }, 0) / results.length
+        ),
         score_distribution: distribution
       }
     });
@@ -279,8 +301,8 @@ router.get('/analytics/:test_id', adminAuth, async (req, res) => {
 router.get('/:result_id', async (req, res) => {
   try {
     const result = await Result.findById(req.params.result_id)
-      .populate('student_id', 'name telegram_username')
-      .populate('test_id', 'title type duration_minutes')
+      .populate('student_id',       'name telegram_username')
+      .populate('test_id',          'title type duration_minutes')
       .populate('wrong_questions',   'text options correct_answer explanation reference type')
       .populate('skipped_questions', 'text options correct_answer explanation reference type');
 
