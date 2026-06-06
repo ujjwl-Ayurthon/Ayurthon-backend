@@ -18,20 +18,14 @@ router.get('/check/:test_token/:telegram_username', async (req, res) => {
   try {
     const { test_token, telegram_username } = req.params;
     const cleanTg = telegram_username.toLowerCase().replace('@', '');
-
-    const test = await Test.findOne({ link_token: test_token });
+    const test    = await Test.findOne({ link_token: test_token });
     if (!test) return res.json({ attempted: false });
-
     const student = await Student.findOne({ telegram_username: cleanTg });
-    if (!student) return res.json({ attempted: false });
-
+    if (!student)  return res.json({ attempted: false });
     const existing = await Result.findOne({ student_id: student._id, test_id: test._id });
-    if (existing) {
-      return res.json({ attempted: true, result_id: existing._id });
-    }
+    if (existing)  return res.json({ attempted: true, result_id: existing._id });
     res.json({ attempted: false });
   } catch (err) {
-    console.error('Check error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -47,31 +41,22 @@ router.post('/submit', async (req, res) => {
 
     const test = await Test.findOne({ link_token: test_token, status: 'published' })
       .populate('questions');
-    if (!test) {
-      return res.status(404).json({ error: 'Test not found or already closed' });
-    }
+    if (!test) return res.status(404).json({ error: 'Test not found or already closed' });
 
     const cleanTg = (telegram_username || '').toLowerCase().replace('@', '');
 
-    // Find or create student
     let student = await Student.findOne({ telegram_username: cleanTg });
     if (!student) {
       student = new Student({ name: student_name, telegram_username: cleanTg });
       await student.save();
     }
 
-    // DATABASE-LEVEL PROTECTION
-    // If already submitted — return success with resultId (not error)
+    // DB-level duplicate protection — return success, not error
     const existing = await Result.findOne({ student_id: student._id, test_id: test._id });
     if (existing) {
-      return res.json({
-        success:          true,
-        alreadySubmitted: true,
-        resultId:         existing._id
-      });
+      return res.json({ success: true, alreadySubmitted: true, resultId: existing._id });
     }
 
-    // Process answers
     let correct = 0, incorrect = 0, unattempted = 0;
     const processedAnswers = [];
     const wrongQuestions   = [];
@@ -80,20 +65,13 @@ router.post('/submit', async (req, res) => {
     test.questions.forEach(function(question) {
       const qId      = question._id.toString();
       const selected = (answers[qId] !== undefined && answers[qId] !== null && answers[qId] !== '')
-        ? answers[qId]
-        : null;
+        ? answers[qId] : null;
       const isCorrect = selected !== null && selected === question.correct_answer;
       const isSkipped = selected === null;
 
-      if (isSkipped) {
-        unattempted++;
-        skippedQuestions.push(question._id);
-      } else if (isCorrect) {
-        correct++;
-      } else {
-        incorrect++;
-        wrongQuestions.push(question._id);
-      }
+      if (isSkipped)       { unattempted++; skippedQuestions.push(question._id); }
+      else if (isCorrect)  { correct++; }
+      else                 { incorrect++; wrongQuestions.push(question._id); }
 
       processedAnswers.push({
         question_id:     question._id,
@@ -104,18 +82,20 @@ router.post('/submit', async (req, res) => {
       });
     });
 
-    const negMark  = Number(test.negative_marks) || 0;
-    const score    = correct - (incorrect * negMark);
-    const accuracy = test.questions.length > 0
-      ? Math.round((correct / test.questions.length) * 100)
-      : 0;
+    // ── AIAPGET Scoring: +4 per correct, -negMark per incorrect ──
+    const negMark   = Number(test.negative_marks) || 0;
+    const totalMarks = test.questions.length * 4;
+    const score     = (correct * 4) - (incorrect * negMark);
 
-    // Save result
+    // ── Accuracy: only on ATTEMPTED questions ──────────────
+    const attempted  = correct + incorrect;
+    const accuracy   = attempted > 0 ? Math.round((correct / attempted) * 100) : 0;
+
     const result = new Result({
       student_id:         student._id,
       test_id:            test._id,
       score,
-      total_marks:        test.questions.length,
+      total_marks:        totalMarks,
       correct,
       incorrect,
       unattempted,
@@ -127,11 +107,10 @@ router.post('/submit', async (req, res) => {
     });
     await result.save();
 
-    // Update student attempts
     student.attempts.push(result._id);
     await student.save();
 
-    // Calculate rank: higher score = better rank, tie = less time = better rank
+    // Rank: score DESC, time ASC
     const higherRank = await Result.countDocuments({
       test_id: test._id,
       _id:     { $ne: result._id },
@@ -143,29 +122,27 @@ router.post('/submit', async (req, res) => {
     result.rank = higherRank + 1;
     await result.save();
 
-    // Fetch wrong + skipped question details for result page
     const [wrongDetail, skippedDetail] = await Promise.all([
-      Question.find({ _id: { $in: wrongQuestions } })
-        .select('text options correct_answer explanation reference type'),
-      Question.find({ _id: { $in: skippedQuestions } })
-        .select('text options correct_answer explanation reference type')
+      Question.find({ _id: { $in: wrongQuestions }  }).select('text options correct_answer explanation reference type'),
+      Question.find({ _id: { $in: skippedQuestions }}).select('text options correct_answer explanation reference type')
     ]);
 
     res.json({
       success: true,
       result: {
-        _id:               result._id,
+        _id:                result._id,
         score,
-        total:             test.questions.length,
+        total_marks:        totalMarks,
+        total:              test.questions.length,
         correct,
         incorrect,
         unattempted,
         accuracy,
-        rank:              result.rank,
+        rank:               result.rank,
         time_taken_seconds: Number(time_taken_seconds) || 0,
-        wrong_questions:   wrongDetail,
-        skipped_questions: skippedDetail,
-        answers:           processedAnswers
+        wrong_questions:    wrongDetail,
+        skipped_questions:  skippedDetail,
+        answers:            processedAnswers
       }
     });
 
@@ -175,7 +152,7 @@ router.post('/submit', async (req, res) => {
   }
 });
 
-// ── Leaderboard (score DESC, time ASC) ────────────────────
+// ── Leaderboard ────────────────────────────────────────────
 router.get('/leaderboard/:test_id', async (req, res) => {
   try {
     const { limit = 100 } = req.query;
@@ -185,16 +162,19 @@ router.get('/leaderboard/:test_id', async (req, res) => {
       .populate('student_id', 'name telegram_username');
 
     const leaderboard = results.map(function(r, i) {
+      const attempted = (r.correct || 0) + (r.incorrect || 0);
+      const acc       = attempted > 0 ? Math.round((r.correct / attempted) * 100) : 0;
       return {
         rank:              i + 1,
         name:              r.student_id ? r.student_id.name : 'Unknown',
         telegram_username: r.student_id ? r.student_id.telegram_username : '',
         score:             r.score,
+        total_marks:       r.total_marks,
         total:             r.total_marks,
         correct:           r.correct,
         incorrect:         r.incorrect,
         unattempted:       r.unattempted || 0,
-        accuracy:          r.accuracy,
+        accuracy:          acc,
         time_taken:        r.time_taken_seconds
       };
     });
@@ -215,15 +195,18 @@ router.get('/sheet/:test_id', adminAuth, async (req, res) => {
       .populate('student_id', 'name telegram_username');
 
     const sheet = results.map(function(r, i) {
+      const attempted = (r.correct || 0) + (r.incorrect || 0);
+      const acc       = attempted > 0 ? Math.round((r.correct / attempted) * 100) : 0;
       return {
         rank:              i + 1,
         name:              r.student_id ? r.student_id.name : 'Unknown',
         telegram_username: r.student_id ? r.student_id.telegram_username : '',
         score:             r.score,
+        total_marks:       r.total_marks,
         correct:           r.correct,
         incorrect:         r.incorrect,
         unattempted:       r.unattempted || 0,
-        accuracy:          r.accuracy,
+        accuracy:          acc,
         time_taken:        r.time_taken_seconds,
         responses:         (r.answers || []).map(function(a) {
           return {
@@ -237,12 +220,7 @@ router.get('/sheet/:test_id', adminAuth, async (req, res) => {
       };
     });
 
-    res.json({
-      success:     true,
-      test_title:  test ? test.title : '',
-      questions:   test ? test.questions : [],
-      sheet
-    });
+    res.json({ success: true, test_title: test ? test.title : '', questions: test ? test.questions : [], sheet });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -260,24 +238,39 @@ router.get('/test/:test_id', adminAuth, async (req, res) => {
   }
 });
 
-// ── Analytics ──────────────────────────────────────────────
+// ── Analytics — aggregate-based correct metrics ────────────
 router.get('/analytics/:test_id', adminAuth, async (req, res) => {
   try {
     const results = await Result.find({ test_id: req.params.test_id });
     if (results.length === 0) return res.json({ success: true, analytics: null });
 
     const scores = results.map(function(r) { return r.score; });
-    const avg    = scores.reduce(function(a, b) { return a + b; }, 0) / scores.length;
-    const total  = results[0].total_marks;
+
+    // Global accuracy: total correct / total attempted (aggregate ratio)
+    let totalCorrect   = 0;
+    let totalAttempted = 0;
+    results.forEach(function(r) {
+      totalCorrect   += (r.correct   || 0);
+      totalAttempted += (r.correct   || 0) + (r.incorrect || 0);
+    });
+    const globalAccuracy = totalAttempted > 0
+      ? Math.round((totalCorrect / totalAttempted) * 100)
+      : 0;
+
+    const totalQ = results[0].total_marks
+      ? Math.round(results[0].total_marks / 4)
+      : 1;
 
     const distribution = { '0-25': 0, '26-50': 0, '51-75': 0, '76-100': 0 };
     results.forEach(function(r) {
-      const pct = (r.score / total) * 100;
+      const pct = (r.score / (totalQ * 4)) * 100;
       if      (pct <= 25) distribution['0-25']++;
       else if (pct <= 50) distribution['26-50']++;
       else if (pct <= 75) distribution['51-75']++;
       else                distribution['76-100']++;
     });
+
+    const avg = scores.reduce(function(a, b) { return a + b; }, 0) / scores.length;
 
     res.json({
       success: true,
@@ -286,9 +279,7 @@ router.get('/analytics/:test_id', adminAuth, async (req, res) => {
         average_score:      Math.round(avg * 10) / 10,
         highest_score:      Math.max.apply(null, scores),
         lowest_score:       Math.min.apply(null, scores),
-        average_accuracy:   Math.round(
-          results.reduce(function(a, r) { return a + r.accuracy; }, 0) / results.length
-        ),
+        average_accuracy:   globalAccuracy,
         score_distribution: distribution
       }
     });
@@ -305,7 +296,6 @@ router.get('/:result_id', async (req, res) => {
       .populate('test_id',          'title type duration_minutes')
       .populate('wrong_questions',   'text options correct_answer explanation reference type')
       .populate('skipped_questions', 'text options correct_answer explanation reference type');
-
     if (!result) return res.status(404).json({ error: 'Result not found' });
     res.json({ success: true, result });
   } catch (err) {
