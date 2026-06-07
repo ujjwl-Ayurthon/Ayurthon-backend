@@ -43,6 +43,11 @@ router.post('/submit', async (req, res) => {
       .populate('questions');
     if (!test) return res.status(404).json({ error: 'Test not found or already closed' });
 
+    // Check expiry
+    if (test.expires_at && new Date() > new Date(test.expires_at)) {
+      return res.status(403).json({ error: 'Test link expired hai' });
+    }
+
     const cleanTg = (telegram_username || '').toLowerCase().replace('@', '');
 
     let student = await Student.findOne({ telegram_username: cleanTg });
@@ -51,7 +56,7 @@ router.post('/submit', async (req, res) => {
       await student.save();
     }
 
-    // DB-level duplicate protection
+    // DB duplicate protection — return existing result gracefully
     const existing = await Result.findOne({ student_id: student._id, test_id: test._id });
     if (existing) {
       return res.json({ success: true, alreadySubmitted: true, resultId: existing._id });
@@ -62,18 +67,17 @@ router.post('/submit', async (req, res) => {
     const wrongQuestions   = [];
     const skippedQuestions = [];
 
-    // Process ALL questions — mandatory for frontend tabs
+    // Process ALL questions — mandatory for all tabs in ResultPage
     test.questions.forEach(function(question) {
       const qId      = question._id.toString();
       const selected = (answers[qId] !== undefined && answers[qId] !== null && answers[qId] !== '')
-        ? answers[qId] : null;
+        ? String(answers[qId]) : null;
       const isSkipped = selected === null;
       const isCorrect = !isSkipped && selected === question.correct_answer;
 
       if (isSkipped) {
         unattempted++;
         skippedQuestions.push(question._id);
-        // Explicit skipped entry for frontend display
         processedAnswers.push({
           question_id:     question._id,
           selected_option: null,
@@ -103,12 +107,17 @@ router.post('/submit', async (req, res) => {
       }
     });
 
-    // AIAPGET Scoring: +4 correct, -negMark incorrect
-    const negMark    = Number(test.negative_marks) || 0;
-    const totalMarks = test.questions.length * 4;
-    const score      = (correct * 4) - (incorrect * negMark);
+    // ── STRICT INTEGER SCORING ─────────────────────────────
+    // correctMarks and negMarks forced to integer to prevent float leakage
+    const correctMarks = Math.round(Number(test.correct_marks  || 4));
+    const negMarks     = Math.round(Math.abs(Number(test.negative_marks || 1)));
+    const totalMarks   = test.questions.length * correctMarks;
 
-    // Accuracy: only on ATTEMPTED questions
+    // Integer arithmetic only — no floats
+    const rawScore     = (correct * correctMarks) - (incorrect * negMarks);
+    const score        = Math.round(rawScore); // force integer even if somehow float
+
+    // Accuracy: ONLY on attempted questions
     const attempted = correct + incorrect;
     const accuracy  = attempted > 0 ? Math.round((correct / attempted) * 100) : 0;
 
@@ -121,7 +130,7 @@ router.post('/submit', async (req, res) => {
       incorrect,
       unattempted,
       accuracy,
-      time_taken_seconds: Number(time_taken_seconds) || 0,
+      time_taken_seconds: Math.round(Number(time_taken_seconds) || 0),
       answers:            processedAnswers,
       wrong_questions:    wrongQuestions,
       skipped_questions:  skippedQuestions
@@ -131,22 +140,26 @@ router.post('/submit', async (req, res) => {
     student.attempts.push(result._id);
     await student.save();
 
-    // Rank: score DESC, time_taken_seconds ASC (tie-break)
+    // Rank: score DESC, time ASC (tie-break)
     const higherRank = await Result.countDocuments({
       test_id: test._id,
       _id:     { $ne: result._id },
       $or: [
         { score: { $gt: score } },
-        { score: score, time_taken_seconds: { $lt: Number(time_taken_seconds) || 0 } }
+        { score: score, time_taken_seconds: { $lt: Math.round(Number(time_taken_seconds) || 0) } }
       ]
     });
     result.rank = higherRank + 1;
     await result.save();
 
-    // Fetch question details for result page
-    const [wrongDetail, skippedDetail] = await Promise.all([
+    // Fetch question details for review tabs
+    const [wrongDetail, skippedDetail, correctDetail] = await Promise.all([
       Question.find({ _id: { $in: wrongQuestions   } }).select('text options correct_answer explanation reference type'),
-      Question.find({ _id: { $in: skippedQuestions } }).select('text options correct_answer explanation reference type')
+      Question.find({ _id: { $in: skippedQuestions } }).select('text options correct_answer explanation reference type'),
+      Question.find({ _id: { $in: test.questions.filter(function(q) {
+        const a = processedAnswers.find(function(a) { return a.question_id.toString() === q._id.toString() });
+        return a && a.is_correct;
+      }).map(function(q) { return q._id }) } }).select('text options correct_answer explanation reference type')
     ]);
 
     res.json({
@@ -161,9 +174,12 @@ router.post('/submit', async (req, res) => {
         unattempted,
         accuracy,
         rank:               result.rank,
-        time_taken_seconds: Number(time_taken_seconds) || 0,
+        correct_marks:      correctMarks,
+        negative_marks:     negMarks,
+        time_taken_seconds: Math.round(Number(time_taken_seconds) || 0),
         wrong_questions:    wrongDetail,
         skipped_questions:  skippedDetail,
+        correct_questions:  correctDetail,
         answers:            processedAnswers
       }
     });
@@ -192,7 +208,6 @@ router.get('/leaderboard/:test_id', async (req, res) => {
         telegram_username: r.student_id ? r.student_id.telegram_username : '',
         score:             r.score,
         total_marks:       r.total_marks,
-        total:             r.total_marks,
         correct:           r.correct,
         incorrect:         r.incorrect,
         unattempted:       r.unattempted || 0,
@@ -207,7 +222,7 @@ router.get('/leaderboard/:test_id', async (req, res) => {
   }
 });
 
-// ── Admin: Full Response Sheet ─────────────────────────────
+// ── Admin: Response Sheet ──────────────────────────────────
 router.get('/sheet/:test_id', adminAuth, async (req, res) => {
   try {
     const test = await Test.findById(req.params.test_id)
@@ -260,7 +275,7 @@ router.get('/test/:test_id', adminAuth, async (req, res) => {
   }
 });
 
-// ── Analytics ──────────────────────────────────────────────
+// ── Analytics — aggregate accuracy ────────────────────────
 router.get('/analytics/:test_id', adminAuth, async (req, res) => {
   try {
     const results = await Result.find({ test_id: req.params.test_id });
@@ -268,6 +283,7 @@ router.get('/analytics/:test_id', adminAuth, async (req, res) => {
 
     const scores = results.map(function(r) { return r.score; });
 
+    // Global accuracy: aggregate ratio not flat average
     let totalCorrect = 0, totalAttempted = 0;
     results.forEach(function(r) {
       totalCorrect   += (r.correct   || 0);
@@ -279,7 +295,7 @@ router.get('/analytics/:test_id', adminAuth, async (req, res) => {
     const maxMarks = results[0].total_marks || 1;
     const distribution = { '0-25': 0, '26-50': 0, '51-75': 0, '76-100': 0 };
     results.forEach(function(r) {
-      const pct = (r.score / maxMarks) * 100;
+      const pct = Math.round((r.score / maxMarks) * 100);
       if      (pct <= 25) distribution['0-25']++;
       else if (pct <= 50) distribution['26-50']++;
       else if (pct <= 75) distribution['51-75']++;
@@ -309,7 +325,7 @@ router.get('/:result_id', async (req, res) => {
   try {
     const result = await Result.findById(req.params.result_id)
       .populate('student_id',       'name telegram_username')
-      .populate('test_id',          'title type duration_minutes')
+      .populate('test_id',          'title type duration_minutes correct_marks negative_marks')
       .populate('wrong_questions',   'text options correct_answer explanation reference type')
       .populate('skipped_questions', 'text options correct_answer explanation reference type');
     if (!result) return res.status(404).json({ error: 'Result not found' });
