@@ -13,19 +13,21 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ── Channels list ──────────────────────────────────────────
+// ── Channels ───────────────────────────────────────────────
 router.get('/channels/list', adminAuth, (req, res) => {
-  try {
-    res.json({ success: true, channels: getChannelList() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  try { res.json({ success: true, channels: getChannelList() }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Scheduled auto-publish (call every 5 min via cron) ────
+// ── Scheduled auto-publish ─────────────────────────────────
+// IST = UTC + 5:30. scheduled_at stored as UTC in DB.
+// new Date() is UTC — comparison is correct automatically.
+// Bug was in frontend not converting IST→UTC properly (fixed in TestList.jsx).
 router.post('/scheduled/run', async (req, res) => {
   try {
-    const now     = new Date();
+    const now = new Date();
+
+    // Auto-publish pending scheduled tests
     const pending = await Test.find({
       status:       'draft',
       scheduled_at: { $lte: now, $ne: null }
@@ -48,7 +50,7 @@ router.post('/scheduled/run', async (req, res) => {
       }
     }
 
-    // Auto-close expired tests
+    // Auto-close expired published tests
     const expired = await Test.find({
       status:     'published',
       expires_at: { $lte: now, $ne: null }
@@ -73,24 +75,29 @@ router.post('/scheduled/run', async (req, res) => {
 router.post('/', adminAuth, async (req, res) => {
   try {
     const { title, type, question_ids, duration_minutes,
-            sections, negative_marks, scheduled_at, scheduled_channel, expires_at } = req.body;
+            sections, correct_marks, negative_marks,
+            scheduled_at, scheduled_channel, expires_at } = req.body;
 
     if (!title || !type || !question_ids || question_ids.length === 0) {
       return res.status(400).json({ error: 'title, type and question_ids required' });
     }
 
-    const totalMarks = question_ids.length * 4;
+    // Force integer marks
+    const cm         = Math.round(Number(correct_marks  || 4));
+    const nm         = Math.round(Math.abs(Number(negative_marks || 1)));
+    const totalMarks = question_ids.length * cm;
 
     const test = new Test({
       title, type,
       questions:          question_ids,
-      duration_minutes:   Number(duration_minutes)   || 60,
+      duration_minutes:   Math.round(Number(duration_minutes) || 60),
       total_marks:        totalMarks,
-      negative_marks:     Number(negative_marks)     || 0,
-      sections:           sections                   || [],
-      scheduled_at:       scheduled_at               || null,
-      scheduled_channel:  scheduled_channel          || null,
-      expires_at:         expires_at                 || null
+      correct_marks:      cm,
+      negative_marks:     nm,
+      sections:           sections          || [],
+      scheduled_at:       scheduled_at      || null,
+      scheduled_channel:  scheduled_channel || null,
+      expires_at:         expires_at        || null
     });
     await test.save();
     await Question.updateMany({ _id: { $in: question_ids } }, { $push: { used_in_tests: test._id } });
@@ -127,12 +134,9 @@ router.get('/attempt/:token', async (req, res) => {
     const test = await Test.findOne({ link_token: req.params.token, status: 'published' })
       .populate('questions', 'text type options reference');
     if (!test) return res.status(404).json({ error: 'Test not found or not active' });
-
-    // Check if expired
     if (test.expires_at && new Date() > new Date(test.expires_at)) {
       return res.status(404).json({ error: 'Test link expired hai' });
     }
-
     res.json({ success: true, test });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -142,26 +146,25 @@ router.get('/attempt/:token', async (req, res) => {
 // ── Edit Draft Test ────────────────────────────────────────
 router.put('/:id', adminAuth, async (req, res) => {
   try {
-    const { title, type, duration_minutes, negative_marks,
+    const { title, type, duration_minutes, correct_marks, negative_marks,
             question_ids, scheduled_at, scheduled_channel, expires_at } = req.body;
 
     const test = await Test.findById(req.params.id);
     if (!test) return res.status(404).json({ error: 'Test not found' });
-    if (test.status !== 'draft') {
-      return res.status(400).json({ error: 'Only draft tests can be edited' });
-    }
+    if (test.status !== 'draft') return res.status(400).json({ error: 'Only draft tests can be edited' });
 
-    if (title)                        test.title             = title;
-    if (type)                         test.type              = type;
-    if (duration_minutes)             test.duration_minutes  = Number(duration_minutes);
-    if (negative_marks !== undefined) test.negative_marks    = Number(negative_marks);
-    if (scheduled_at !== undefined)   test.scheduled_at      = scheduled_at || null;
+    if (title)                           test.title             = title;
+    if (type)                            test.type              = type;
+    if (duration_minutes)                test.duration_minutes  = Math.round(Number(duration_minutes));
+    if (correct_marks  !== undefined)    test.correct_marks     = Math.round(Number(correct_marks  || 4));
+    if (negative_marks !== undefined)    test.negative_marks    = Math.round(Math.abs(Number(negative_marks || 1)));
+    if (scheduled_at   !== undefined)    test.scheduled_at      = scheduled_at   || null;
     if (scheduled_channel !== undefined) test.scheduled_channel = scheduled_channel || null;
-    if (expires_at !== undefined)     test.expires_at        = expires_at || null;
+    if (expires_at     !== undefined)    test.expires_at        = expires_at     || null;
 
     if (question_ids && question_ids.length > 0) {
       test.questions   = question_ids;
-      test.total_marks = question_ids.length * 4;
+      test.total_marks = question_ids.length * (test.correct_marks || 4);
     }
 
     await test.save();
@@ -208,10 +211,7 @@ router.post('/:id/recalculate-ranks', adminAuth, async (req, res) => {
   try {
     const results = await Result.find({ test_id: req.params.id })
       .sort({ score: -1, time_taken_seconds: 1 });
-    for (let i = 0; i < results.length; i++) {
-      results[i].rank = i + 1;
-      await results[i].save();
-    }
+    for (let i = 0; i < results.length; i++) { results[i].rank = i + 1; await results[i].save(); }
     res.json({ success: true, updated: results.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -223,10 +223,7 @@ router.post('/:id/close', adminAuth, async (req, res) => {
   try {
     const results = await Result.find({ test_id: req.params.id })
       .sort({ score: -1, time_taken_seconds: 1 });
-    for (let i = 0; i < results.length; i++) {
-      results[i].rank = i + 1;
-      await results[i].save();
-    }
+    for (let i = 0; i < results.length; i++) { results[i].rank = i + 1; await results[i].save(); }
     const test = await Test.findByIdAndUpdate(
       req.params.id,
       { status: 'closed', closed_at: new Date() },
