@@ -17,22 +17,20 @@ const TestSchema = new mongoose.Schema({
   status:            { type: String, enum: ['draft','published','closed'], default: 'draft' },
   link_token:        { type: String, default: generateToken, unique: true },
   sections:          [{
-    subject:       String,
-    sthan:         String,
-    chapter:       String,
-    range_start:   Number,
-    range_end:     Number,
-    question_count:Number
+    subject: String, sthan: String, chapter: String,
+    range_start: Number, range_end: Number, question_count: Number
   }],
-  total_marks:        { type: Number, default: 0 },
-  negative_marks:     { type: Number, default: 0 },
-  telegram_sent:      { type: Boolean, default: false },
-  scheduled_at:       { type: Date, default: null },
-  scheduled_channel:  { type: String, default: null },
-  expires_at:         { type: Date, default: null },
-  published_at:       { type: Date },
-  closed_at:          { type: Date },
-  created_at:         { type: Date, default: Date.now }
+  // Marks config — explicit integers
+  correct_marks:     { type: Number, default: 4 },
+  negative_marks:    { type: Number, default: 1 },
+  total_marks:       { type: Number, default: 0 },
+  telegram_sent:     { type: Boolean, default: false },
+  scheduled_at:      { type: Date, default: null },
+  scheduled_channel: { type: String, default: null },
+  expires_at:        { type: Date, default: null },
+  published_at:      { type: Date },
+  closed_at:         { type: Date },
+  created_at:        { type: Date, default: Date.now }
 });
 
 module.exports = mongoose.model('Test', TestSchema);
