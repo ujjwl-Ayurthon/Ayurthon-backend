@@ -19,28 +19,23 @@ router.get('/channels/list', adminAuth, (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Scheduled auto-publish ─────────────────────────────────
-// IST = UTC + 5:30. scheduled_at stored as UTC in DB.
-// new Date() is UTC — comparison is correct automatically.
-// Bug was in frontend not converting IST→UTC properly (fixed in TestList.jsx).
+// ── Scheduled auto-publish & auto-close ───────────────────
 router.post('/scheduled/run', async (req, res) => {
   try {
     const now = new Date();
-
-    // Auto-publish pending scheduled tests
     const pending = await Test.find({
-      status:       'draft',
+      status: 'draft',
       scheduled_at: { $lte: now, $ne: null }
     }).populate('questions');
 
     const published = [];
     for (const test of pending) {
       try {
-        test.status       = 'published';
+        test.status = 'published';
         test.published_at = now;
         await test.save();
         const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
-        const testLink    = frontendUrl + '/test/' + test.link_token;
+        const testLink = frontendUrl + '/test/' + test.link_token;
         await sendTestToChannel(test, testLink, test.scheduled_channel || null, null);
         test.telegram_sent = true;
         await test.save();
@@ -50,16 +45,15 @@ router.post('/scheduled/run', async (req, res) => {
       }
     }
 
-    // Auto-close expired published tests
     const expired = await Test.find({
-      status:     'published',
+      status: 'published',
       expires_at: { $lte: now, $ne: null }
     });
     const closed = [];
     for (const test of expired) {
       const results = await Result.find({ test_id: test._id }).sort({ score: -1, time_taken_seconds: 1 });
       for (let i = 0; i < results.length; i++) { results[i].rank = i + 1; await results[i].save(); }
-      test.status    = 'closed';
+      test.status = 'closed';
       test.closed_at = now;
       await test.save();
       closed.push(test.title);
@@ -82,22 +76,21 @@ router.post('/', adminAuth, async (req, res) => {
       return res.status(400).json({ error: 'title, type and question_ids required' });
     }
 
-    // Force integer marks
-    const cm         = Math.round(Number(correct_marks  || 4));
-    const nm         = Math.round(Math.abs(Number(negative_marks || 1)));
+    const cm = Math.round(Number(correct_marks || 4));
+    const nm = Math.round(Math.abs(Number(negative_marks || 1)));
     const totalMarks = question_ids.length * cm;
 
     const test = new Test({
       title, type,
-      questions:          question_ids,
-      duration_minutes:   Math.round(Number(duration_minutes) || 60),
-      total_marks:        totalMarks,
-      correct_marks:      cm,
-      negative_marks:     nm,
-      sections:           sections          || [],
-      scheduled_at:       scheduled_at      || null,
-      scheduled_channel:  scheduled_channel || null,
-      expires_at:         expires_at        || null
+      questions:         question_ids,
+      duration_minutes:  Math.round(Number(duration_minutes) || 60),
+      total_marks:       totalMarks,
+      correct_marks:     cm,
+      negative_marks:    nm,
+      sections:          sections          || [],
+      scheduled_at:      scheduled_at      || null,
+      scheduled_channel: scheduled_channel || null,
+      expires_at:        expires_at        || null
     });
     await test.save();
     await Question.updateMany({ _id: { $in: question_ids } }, { $push: { used_in_tests: test._id } });
@@ -117,10 +110,12 @@ router.get('/', adminAuth, async (req, res) => {
   }
 });
 
-// ── Get Single Test ────────────────────────────────────────
+// ── Get Single Test — ALWAYS return full questions (admin) ─
+// No status restriction — admin can view questions for ANY status
 router.get('/:id', adminAuth, async (req, res) => {
   try {
-    const test = await Test.findById(req.params.id).populate('questions');
+    const test = await Test.findById(req.params.id)
+      .populate('questions'); // always populated, no status filter
     if (!test) return res.status(404).json({ error: 'Test not found' });
     res.json({ success: true, test });
   } catch (err) {
@@ -143,7 +138,8 @@ router.get('/attempt/:token', async (req, res) => {
   }
 });
 
-// ── Edit Draft Test ────────────────────────────────────────
+// ── Edit Test — allowed for ANY status (draft/published/closed) ──
+// Admin can always fix title, marks, schedule
 router.put('/:id', adminAuth, async (req, res) => {
   try {
     const { title, type, duration_minutes, correct_marks, negative_marks,
@@ -151,16 +147,16 @@ router.put('/:id', adminAuth, async (req, res) => {
 
     const test = await Test.findById(req.params.id);
     if (!test) return res.status(404).json({ error: 'Test not found' });
-    if (test.status !== 'draft') return res.status(400).json({ error: 'Only draft tests can be edited' });
 
+    // Allow edit for ALL statuses — admin needs full control
     if (title)                           test.title             = title;
     if (type)                            test.type              = type;
     if (duration_minutes)                test.duration_minutes  = Math.round(Number(duration_minutes));
     if (correct_marks  !== undefined)    test.correct_marks     = Math.round(Number(correct_marks  || 4));
     if (negative_marks !== undefined)    test.negative_marks    = Math.round(Math.abs(Number(negative_marks || 1)));
-    if (scheduled_at   !== undefined)    test.scheduled_at      = scheduled_at   || null;
+    if (scheduled_at   !== undefined)    test.scheduled_at      = scheduled_at      || null;
     if (scheduled_channel !== undefined) test.scheduled_channel = scheduled_channel || null;
-    if (expires_at     !== undefined)    test.expires_at        = expires_at     || null;
+    if (expires_at     !== undefined)    test.expires_at        = expires_at        || null;
 
     if (question_ids && question_ids.length > 0) {
       test.questions   = question_ids;
@@ -169,6 +165,35 @@ router.put('/:id', adminAuth, async (req, res) => {
 
     await test.save();
     res.json({ success: true, test });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Update a single question inside a test ─────────────────
+// Works regardless of test status — admin can fix typos anytime
+router.put('/:test_id/question/:question_id', adminAuth, async (req, res) => {
+  try {
+    const { text, options, correct_answer, explanation, reference, type } = req.body;
+
+    // Verify question belongs to this test
+    const test = await Test.findById(req.params.test_id);
+    if (!test) return res.status(404).json({ error: 'Test not found' });
+
+    const qInTest = test.questions.some(function(qId) {
+      return qId.toString() === req.params.question_id;
+    });
+    if (!qInTest) return res.status(403).json({ error: 'Question does not belong to this test' });
+
+    // Update the question — no status restriction
+    const updated = await Question.findByIdAndUpdate(
+      req.params.question_id,
+      { text, options, correct_answer, explanation, reference, type },
+      { new: true, runValidators: true }
+    );
+    if (!updated) return res.status(404).json({ error: 'Question not found' });
+
+    res.json({ success: true, question: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
