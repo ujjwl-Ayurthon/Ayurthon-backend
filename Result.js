@@ -18,12 +18,13 @@ const ResultSchema = new mongoose.Schema({
     question_id:     { type: mongoose.Schema.Types.ObjectId, ref: 'Question' },
     selected_option: { type: String, default: null },
     correct_option:  { type: String },
-    is_correct:      { type: Boolean },
+    is_correct:      { type: Boolean, default: false },
     is_skipped:      { type: Boolean, default: false }
   }],
 
   wrong_questions:   [{ type: mongoose.Schema.Types.ObjectId, ref: 'Question' }],
   skipped_questions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Question' }],
+  correct_questions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Question' }],
 
   submitted_at: { type: Date, default: Date.now }
 });
