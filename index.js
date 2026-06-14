@@ -6,7 +6,7 @@ require('dotenv').config();
 
 const app = express();
 
-// 💡 OODA FIX: Trust proxy enabled to prevent ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on Render/Vercel
+// 💡 CRITICAL FIXED ORDER: Rate limiter load hone se pehle proxy trust hona zaroori hai
 app.set('trust proxy', 1);
 
 app.use(cors({
@@ -16,11 +16,11 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 
-// Rate limiter configuration with global network proxy validations turned off
+// Safe rate limiter config without strict global headers validations
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 300, // Limit each IP to 300 requests per windowMs
-  validate: { trustProxy: false } // 👈 Forces express-rate-limit to ignore proxy header checks
+  max: 300, 
+  validate: false // 👈 Yeh poore validation checks ko force-shutoff kar dega taaki crash zero ho jaye
 });
 
 app.use(limiter);
