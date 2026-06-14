@@ -6,18 +6,32 @@ require('dotenv').config();
 
 const app = express();
 
+// 💡 OODA FIX: Trust proxy enabled to prevent ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on Render/Vercel
+app.set('trust proxy', 1);
+
 app.use(cors({
   origin: [process.env.FRONTEND_URL, 'http://localhost:5173', 'http://localhost:3000'],
   credentials: true
 }));
+
 app.use(express.json({ limit: '10mb' }));
 
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
+// Rate limiter configuration with global network proxy validations turned off
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300, // Limit each IP to 300 requests per windowMs
+  validate: { trustProxy: false } // 👈 Forces express-rate-limit to ignore proxy header checks
+});
+
 app.use(limiter);
 
 mongoose.connect(process.env.MONGODB_URI)
-  .then(function() { console.log('✅ MongoDB Connected'); })
-  .catch(function(err) { console.error('❌ MongoDB Error:', err); });
+  .then(function() {
+    console.log('✅ MongoDB Connected');
+  })
+  .catch(function(err) {
+    console.error('❌ MongoDB Error:', err);
+  });
 
 // ── Routes ────────────────────────────────────────────────
 app.use('/api/questions',        require('./questions'));
@@ -37,4 +51,6 @@ app.get('/', function(req, res) {
 require('./telegramBot');
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, function() { console.log('🚀 Server on port ' + PORT); });
+app.listen(PORT, function() {
+  console.log('🚀 Server on port ' + PORT);
+});
