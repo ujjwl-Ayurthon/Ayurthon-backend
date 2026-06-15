@@ -1,6 +1,3 @@
-// ============================================================
-// index.js — COMPLETE REPLACEMENT
-// ============================================================
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -9,31 +6,24 @@ require('dotenv').config();
 
 const app = express();
 
-// REQUIRED: Trust Render/Vercel reverse proxy
-// Must be BEFORE any middleware
+// REQUIRED: Trust Render reverse proxy - MUST be first
 app.set('trust proxy', 1);
 
-// CORS — allow Vercel frontend
+// CORS
 app.use(cors({
   origin: function(origin, callback) {
-    var allowed = [
-      process.env.FRONTEND_URL,
-      'http://localhost:5173',
-      'http://localhost:3000',
-    ];
-    // Allow requests with no origin (mobile apps, curl)
     if (!origin) return callback(null, true);
+    if (origin.endsWith('.vercel.app')) return callback(null, true);
+    var allowed = [process.env.FRONTEND_URL, 'http://localhost:5173', 'http://localhost:3000'];
     if (allowed.indexOf(origin) !== -1) return callback(null, true);
-    // Allow any vercel.app subdomain
-    if (origin && origin.endsWith('.vercel.app')) return callback(null, true);
-    return callback(null, true); // permissive for now — tighten after testing
+    return callback(null, true);
   },
   credentials: true,
 }));
 
 app.use(express.json({ limit: '10mb' }));
 
-// Rate limiter — validate:false prevents X-Forwarded-For crash
+// Rate limiter - validate:false prevents X-Forwarded-For crash
 var limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
@@ -41,24 +31,37 @@ var limiter = rateLimit({
 });
 app.use(limiter);
 
-// DB
+// MongoDB
 mongoose.connect(process.env.MONGODB_URI)
   .then(function() { console.log('MongoDB Connected'); })
   .catch(function(err) { console.error('MongoDB Error:', err.message); });
 
-// Routes — ORDER MATTERS
-// Specific routes before dynamic ones
-app.use('/api/admin', require('./routes/admin'));
-app.use('/api/auth', require('./routes/auth').router || require('./routes/auth'));
-app.use('/api/questions', require('./routes/questions'));
-app.use('/api/tests', require('./routes/tests'));
-app.use('/api/results', require('./routes/results'));
-app.use('/api/students', require('./routes/students'));
-app.use('/api/student/dashboard', require('./routes/studentDashboard'));
+// ── ROUTES — flat file structure (no routes/ subfolder) ──────────────────────
+// admin.js is in ROOT, not routes/admin.js
+var adminRoute = require('./admin');
+app.use('/api/admin', adminRoute);
+
+var authRoute = require('./auth');
+app.use('/api/auth', authRoute.router || authRoute);
+
+var questionsRoute = require('./questions');
+app.use('/api/questions', questionsRoute);
+
+var testsRoute = require('./tests');
+app.use('/api/tests', testsRoute);
+
+var resultsRoute = require('./results');
+app.use('/api/results', resultsRoute);
+
+var studentsRoute = require('./students');
+app.use('/api/students', studentsRoute);
+
+var studentDashRoute = require('./studentDashboard');
+app.use('/api/student/dashboard', studentDashRoute);
 
 // Health check
 app.get('/health', function(req, res) {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
 var PORT = process.env.PORT || 5000;
